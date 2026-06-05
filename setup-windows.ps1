@@ -216,7 +216,7 @@ echo "Docker instalado: $(docker --version)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Configura wsl.conf + baixa imagem + cria container
+# 5. Configura wsl.conf + escreve arquivos + sobe stack via Docker Compose
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Step 5 "Configurando Docker e iniciando Moura Automation..."
 
@@ -227,7 +227,209 @@ Write-BashScript -Path $wslConfFile -Content $wslConf
 & wsl -d $distroName -u root -- cp (ConvertTo-WslPath $wslConfFile) /etc/wsl.conf
 Write-Info "/etc/wsl.conf configurado"
 
-# Pull + create container
+# nginx.conf principal
+$nginxMain = @'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    client_max_body_size 50M;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml text/javascript
+               application/json application/javascript application/xml+rss
+               application/rss+xml font/truetype font/opentype
+               application/vnd.ms-fontobject image/svg+xml;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+'@
+
+# nginx site config (roteia /api -> api:3001, / -> frontend:80)
+$nginxSite = @'
+upstream api {
+    server api:3001;
+}
+
+upstream frontend {
+    server frontend:80;
+}
+
+server {
+    listen 80;
+    server_name _;
+    client_max_body_size 50M;
+
+    location /api {
+        rewrite ^/api/(.*) /$1 break;
+        proxy_pass http://api;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+    }
+
+    location / {
+        proxy_pass http://frontend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+'@
+
+# docker-compose.yml para Windows (usa imagens pre-construidas do Docker Hub)
+$composeContent = @'
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bank_statements_postgres
+    environment:
+      POSTGRES_USER: moura
+      POSTGRES_PASSWORD: moura123
+      POSTGRES_DB: mouradb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "54320:5432"
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moura -d mouradb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db-init:
+    image: walymb/bank-statements-backup:latest
+    container_name: bank_statements_db_init
+    environment:
+      DATABASE_URL: postgres://moura:moura123@postgres:5432/mouradb
+    command: ["/usr/local/bin/restore.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: "no"
+
+  db-backup:
+    image: walymb/bank-statements-backup:latest
+    container_name: bank_statements_db_backup
+    environment:
+      DATABASE_URL: postgres://moura:moura123@postgres:5432/mouradb
+      BACKUP_SCHEDULE: "0 */6 * * *"
+    command: ["/usr/local/bin/entrypoint.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: bank_statements_nginx
+    ports:
+      - "8090:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d/local.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  api:
+    image: walymb/bank-statements-api:latest
+    container_name: bank_statements_api
+    environment:
+      DATABASE_URL: postgres://moura:moura123@postgres:5432/mouradb
+      PORT: 3001
+      JWT_SECRET: moura-silva-jwt-secret-key-change-in-production-2026
+    expose:
+      - "3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  frontend:
+    image: walymb/bank-statements-frontend:local
+    container_name: bank_statements_frontend
+    expose:
+      - "80"
+    depends_on:
+      - api
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+'@
+
+# Salva arquivos de configuracao em temp
+$nginxMainFile = "$env:TEMP\moura-nginx-main.conf"
+$nginxSiteFile = "$env:TEMP\moura-nginx-site.conf"
+$composeFile   = "$env:TEMP\moura-compose.yml"
+Write-BashScript -Path $nginxMainFile -Content $nginxMain
+Write-BashScript -Path $nginxSiteFile -Content $nginxSite
+Write-BashScript -Path $composeFile   -Content $composeContent
+
+# Copia arquivos para /opt/moura no WSL
+& wsl -d $distroName -u root -- mkdir -p /opt/moura/nginx/conf.d
+& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $nginxMainFile) /opt/moura/nginx/nginx.conf
+& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $nginxSiteFile) /opt/moura/nginx/conf.d/local.conf
+& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $composeFile)   /opt/moura/docker-compose.yml
+Write-Info "Arquivos copiados para /opt/moura"
+
+# Instala docker-compose-plugin + baixa imagens + sobe stack
 $runScript = @'
 #!/bin/bash
 set -e
@@ -235,29 +437,22 @@ set -e
 service docker start 2>/dev/null || true
 sleep 3
 
-echo "Baixando imagem walymb/moura-automation:latest..."
-docker pull walymb/moura-automation:latest
-
-if ! docker ps -a --format '{{.Names}}' | grep -q '^moura$'; then
-    echo "Criando container..."
-    docker run -d \
-        --restart=always \
-        -p 8090:8090 \
-        -v moura_pgdata:/var/lib/postgresql/16/main \
-        -e JWT_SECRET=moura-automation-secret-2026 \
-        --name moura \
-        walymb/moura-automation:latest
-    echo "Container criado!"
-else
-    echo "Container ja existe, verificando se esta rodando..."
-    docker start moura 2>/dev/null || true
+if ! docker compose version > /dev/null 2>&1; then
+    echo "Instalando docker compose plugin..."
+    apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
 fi
+
+echo "Baixando imagens..."
+docker compose -f /opt/moura/docker-compose.yml pull
+
+echo "Subindo stack..."
+docker compose -f /opt/moura/docker-compose.yml up -d
 '@
 
 $runFile = "$env:TEMP\run-moura.sh"
 Write-BashScript -Path $runFile -Content $runScript
 & wsl -d $distroName -u root -- bash (ConvertTo-WslPath $runFile)
-Write-OK "Container em execucao"
+Write-OK "Stack em execucao"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Task Scheduler — sobe Docker ao fazer login (uso permanente)
@@ -300,7 +495,8 @@ Write-Host "  - Nao depende do Docker Desktop" -ForegroundColor White
 Write-Host "  - Dados persistidos no volume 'moura_pgdata'" -ForegroundColor White
 Write-Host ""
 Write-Host "  Comandos uteis:" -ForegroundColor Gray
-Write-Host "    Ver logs:   wsl -d $distroName -u root -- docker logs moura" -ForegroundColor Gray
-Write-Host "    Parar:      wsl -d $distroName -u root -- docker stop moura" -ForegroundColor Gray
-Write-Host "    Reiniciar:  wsl -d $distroName -u root -- docker restart moura" -ForegroundColor Gray
+Write-Host "    Ver logs:   wsl -d $distroName -u root -- docker compose -f /opt/moura/docker-compose.yml logs -f" -ForegroundColor Gray
+Write-Host "    Parar:      wsl -d $distroName -u root -- docker compose -f /opt/moura/docker-compose.yml down" -ForegroundColor Gray
+Write-Host "    Reiniciar:  wsl -d $distroName -u root -- docker compose -f /opt/moura/docker-compose.yml restart" -ForegroundColor Gray
 Write-Host ""
+
