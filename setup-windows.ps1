@@ -220,8 +220,27 @@ echo "Docker instalado: $(docker --version)"
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Step 5 "Configurando Docker e iniciando Moura Automation..."
 
-# /etc/wsl.conf — inicia docker automaticamente quando WSL2 sobe
-$wslConf = "[boot]`ncommand = service docker start`n"
+# Detecta se o WSL suporta systemd (versao 0.67.6 ou superior)
+$systemdSupported = $false
+try {
+    $wslVer = & wsl --version 2>&1 | Select-String "WSL version:" | ForEach-Object { $_ -replace "WSL version:\s*","" -replace "\s.*","" }
+    if ($wslVer -match "^(\d+)\.(\d+)") {
+        $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+        if ($major -gt 0 -or $minor -ge 67) { $systemdSupported = $true }
+    }
+} catch {}
+
+if ($systemdSupported) {
+    Write-Info "WSL suporta systemd — usando systemd para inicializacao confiavel do Docker"
+    $wslConf = "[boot]`nsystemd=true`n"
+} else {
+    Write-Warn "WSL sem suporte a systemd — usando boot command com retry"
+    $wslConf = @"
+[boot]
+command = /bin/bash -c 'for i in 1 2 3 4 5; do service docker start && break || sleep 3; done >> /var/log/moura-boot.log 2>&1; sleep 5; docker compose -f /opt/moura/docker-compose.yml up -d >> /var/log/moura-boot.log 2>&1 || true'
+"@
+}
+
 $wslConfFile = "$env:TEMP\wsl.conf"
 Write-BashScript -Path $wslConfFile -Content $wslConf
 & wsl -d $distroName -u root -- cp (ConvertTo-WslPath $wslConfFile) /etc/wsl.conf
@@ -322,25 +341,43 @@ Write-BashScript -Path $composeFile -Content $composeContent
 & wsl -d $distroName -u root -- cp (ConvertTo-WslPath $composeFile) /opt/moura/docker-compose.yml
 Write-Info "Arquivos copiados para /opt/moura"
 
-# Instala docker-compose-plugin + baixa imagens + sobe stack
-$runScript = @'
+# Instala docker-compose-plugin + habilita servico + baixa imagens + sobe stack
+$runScript = @"
 #!/bin/bash
 set -e
 
-service docker start 2>/dev/null || true
-sleep 3
+# Inicia Docker com retry (necessario no primeiro boot apos wsl --shutdown)
+for i in 1 2 3 4 5; do
+    service docker start 2>/dev/null && break
+    echo "Tentativa \$i falhou, aguardando..."
+    sleep 3
+done
+
+# Aguarda daemon ficar pronto
+for i in \$(seq 1 15); do
+    docker info > /dev/null 2>&1 && break
+    echo "Aguardando Docker daemon... (\$i/15)"
+    sleep 2
+done
+
+if ! docker info > /dev/null 2>&1; then
+    echo "ERRO: Docker daemon nao respondeu. Verifique: journalctl -u docker ou /var/log/docker.log"
+    exit 1
+fi
 
 if ! docker compose version > /dev/null 2>&1; then
     echo "Instalando docker compose plugin..."
     apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
 fi
 
+$(if ($systemdSupported) { "# systemd: habilita Docker para iniciar automaticamente no boot do WSL" + [Environment]::NewLine + "systemctl enable docker 2>/dev/null || true" })
+
 echo "Baixando imagens..."
 docker compose -f /opt/moura/docker-compose.yml pull
 
 echo "Subindo stack..."
 docker compose -f /opt/moura/docker-compose.yml up -d
-'@
+"@
 
 $runFile = "$env:TEMP\run-moura.sh"
 Write-BashScript -Path $runFile -Content $runScript
@@ -352,13 +389,40 @@ Write-OK "Stack em execucao"
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Step 6 "Registrando inicializacao automatica permanente..."
 
-# wscript.exe e subsistema GUI — nao abre console nenhum ao executar o wsl
-$vbsContent = "CreateObject(`"WScript.Shell`").Run `"wsl -d $distroName -u root -- service docker start`", 0, False"
-$vbsPath = "$ScriptInstallDir\start-docker.vbs"
-[IO.File]::WriteAllText($vbsPath, $vbsContent, [Text.UTF8Encoding]::new($false))
-Write-Info "Launcher silencioso criado: $vbsPath"
-
 Unregister-ScheduledTask -TaskName $FinalTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+if ($systemdSupported) {
+    # Com systemd o Docker ja inicia sozinho via WSL boot — apenas precisamos
+    # garantir que o WSL inicie no login (o que acontece assim que qualquer wsl
+    # command e executado). Registramos uma tarefa minima que acorda o WSL.
+    $vbsContent = "CreateObject(`"WScript.Shell`").Run `"wsl -d $distroName -u root -- echo ok`", 0, False"
+    $vbsPath = "$ScriptInstallDir\start-docker.vbs"
+    [IO.File]::WriteAllText($vbsPath, $vbsContent, [Text.UTF8Encoding]::new($false))
+    Write-Info "systemd cuida do Docker automaticamente; tarefa acorda o WSL no login"
+} else {
+    # Sem systemd: script bash com retry para docker + compose up
+    $startupBash = @'
+#!/bin/bash
+for i in 1 2 3 4 5; do
+    service docker start 2>/dev/null && break
+    sleep 3
+done
+for i in $(seq 1 15); do
+    docker info > /dev/null 2>&1 && break
+    sleep 2
+done
+docker compose -f /opt/moura/docker-compose.yml up -d >> /var/log/moura-boot.log 2>&1 || true
+'@
+    $startupFile = "$ScriptInstallDir\startup.sh"
+    Write-BashScript -Path $startupFile -Content $startupBash
+    $wslStartupPath = ConvertTo-WslPath $startupFile
+    & wsl -d $distroName -u root -- chmod +x $wslStartupPath 2>&1 | Out-Null
+
+    $vbsContent = "CreateObject(`"WScript.Shell`").Run `"wsl -d $distroName -u root -- bash $wslStartupPath`", 0, False"
+    $vbsPath = "$ScriptInstallDir\start-docker.vbs"
+    [IO.File]::WriteAllText($vbsPath, $vbsContent, [Text.UTF8Encoding]::new($false))
+    Write-Info "Script de startup com retry criado: $vbsPath"
+}
 
 $action = New-ScheduledTaskAction `
     -Execute "wscript.exe" `
