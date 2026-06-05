@@ -227,91 +227,6 @@ Write-BashScript -Path $wslConfFile -Content $wslConf
 & wsl -d $distroName -u root -- cp (ConvertTo-WslPath $wslConfFile) /etc/wsl.conf
 Write-Info "/etc/wsl.conf configurado"
 
-# nginx.conf principal
-$nginxMain = @'
-user nginx;
-worker_processes auto;
-error_log /var/log/nginx/error.log warn;
-pid /var/run/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
-                    '$status $body_bytes_sent "$http_referer" '
-                    '"$http_user_agent" "$http_x_forwarded_for"';
-
-    access_log /var/log/nginx/access.log main;
-
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    types_hash_max_size 2048;
-    client_max_body_size 50M;
-
-    gzip on;
-    gzip_vary on;
-    gzip_proxied any;
-    gzip_comp_level 6;
-    gzip_types text/plain text/css text/xml text/javascript
-               application/json application/javascript application/xml+rss
-               application/rss+xml font/truetype font/opentype
-               application/vnd.ms-fontobject image/svg+xml;
-
-    include /etc/nginx/conf.d/*.conf;
-}
-'@
-
-# nginx site config (roteia /api -> api:3001, / -> frontend:80)
-$nginxSite = @'
-upstream api {
-    server api:3001;
-}
-
-upstream frontend {
-    server frontend:80;
-}
-
-server {
-    listen 80;
-    server_name _;
-    client_max_body_size 50M;
-
-    location /api {
-        rewrite ^/api/(.*) /$1 break;
-        proxy_pass http://api;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-        proxy_read_timeout 300s;
-        proxy_connect_timeout 75s;
-    }
-
-    location / {
-        proxy_pass http://frontend;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
-'@
-
 # docker-compose.yml para Windows (usa imagens pre-construidas do Docker Hub)
 $composeContent = @'
 services:
@@ -362,21 +277,6 @@ services:
       - app-network
     restart: unless-stopped
 
-  nginx:
-    image: nginx:alpine
-    container_name: bank_statements_nginx
-    ports:
-      - "8090:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/conf.d/local.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - api
-      - frontend
-    networks:
-      - app-network
-    restart: unless-stopped
-
   api:
     image: walymb/bank-statements-api:latest
     container_name: bank_statements_api
@@ -384,8 +284,8 @@ services:
       DATABASE_URL: postgres://moura:moura123@postgres:5432/mouradb
       PORT: 3001
       JWT_SECRET: moura-silva-jwt-secret-key-change-in-production-2026
-    expose:
-      - "3001"
+    ports:
+      - "3001:3001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -398,8 +298,8 @@ services:
   frontend:
     image: walymb/bank-statements-frontend:local
     container_name: bank_statements_frontend
-    expose:
-      - "80"
+    ports:
+      - "8090:80"
     depends_on:
       - api
     networks:
@@ -414,19 +314,12 @@ volumes:
   postgres_data:
 '@
 
-# Salva arquivos de configuracao em temp
-$nginxMainFile = "$env:TEMP\moura-nginx-main.conf"
-$nginxSiteFile = "$env:TEMP\moura-nginx-site.conf"
-$composeFile   = "$env:TEMP\moura-compose.yml"
-Write-BashScript -Path $nginxMainFile -Content $nginxMain
-Write-BashScript -Path $nginxSiteFile -Content $nginxSite
-Write-BashScript -Path $composeFile   -Content $composeContent
+# Salva docker-compose em temp e copia para /opt/moura no WSL
+$composeFile = "$env:TEMP\moura-compose.yml"
+Write-BashScript -Path $composeFile -Content $composeContent
 
-# Copia arquivos para /opt/moura no WSL
-& wsl -d $distroName -u root -- mkdir -p /opt/moura/nginx/conf.d
-& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $nginxMainFile) /opt/moura/nginx/nginx.conf
-& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $nginxSiteFile) /opt/moura/nginx/conf.d/local.conf
-& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $composeFile)   /opt/moura/docker-compose.yml
+& wsl -d $distroName -u root -- mkdir -p /opt/moura
+& wsl -d $distroName -u root -- cp (ConvertTo-WslPath $composeFile) /opt/moura/docker-compose.yml
 Write-Info "Arquivos copiados para /opt/moura"
 
 # Instala docker-compose-plugin + baixa imagens + sobe stack
@@ -455,15 +348,21 @@ Write-BashScript -Path $runFile -Content $runScript
 Write-OK "Stack em execucao"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Task Scheduler — sobe Docker ao fazer login (uso permanente)
+# 6. Task Scheduler — sobe Docker ao fazer login (uso permanente, sem janela)
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Step 6 "Registrando inicializacao automatica permanente..."
+
+# wscript.exe e subsistema GUI — nao abre console nenhum ao executar o wsl
+$vbsContent = "CreateObject(`"WScript.Shell`").Run `"wsl -d $distroName -u root -- service docker start`", 0, False"
+$vbsPath = "$ScriptInstallDir\start-docker.vbs"
+[IO.File]::WriteAllText($vbsPath, $vbsContent, [Text.UTF8Encoding]::new($false))
+Write-Info "Launcher silencioso criado: $vbsPath"
 
 Unregister-ScheduledTask -TaskName $FinalTaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $action = New-ScheduledTaskAction `
-    -Execute "wsl.exe" `
-    -Argument "-d $distroName -u root -- service docker start"
+    -Execute "wscript.exe" `
+    -Argument "`"$vbsPath`""
 
 $trigger  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
@@ -475,7 +374,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Inicia Docker no WSL2 para Moura Automation ao fazer login" `
+    -Description "Inicia Docker no WSL2 para Moura Automation ao fazer login (sem janela)" `
     -Force | Out-Null
 
 Write-OK "Tarefa permanente registrada: $FinalTaskName"
@@ -499,4 +398,3 @@ Write-Host "    Ver logs:   wsl -d $distroName -u root -- docker compose -f /opt
 Write-Host "    Parar:      wsl -d $distroName -u root -- docker compose -f /opt/moura/docker-compose.yml down" -ForegroundColor Gray
 Write-Host "    Reiniciar:  wsl -d $distroName -u root -- docker compose -f /opt/moura/docker-compose.yml restart" -ForegroundColor Gray
 Write-Host ""
-
