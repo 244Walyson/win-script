@@ -235,10 +235,7 @@ if ($systemdSupported) {
     $wslConf = "[boot]`nsystemd=true`n"
 } else {
     Write-Warn "WSL sem suporte a systemd — usando boot command com retry"
-    $wslConf = @"
-[boot]
-command = /bin/bash -c 'for i in 1 2 3 4 5; do service docker start && break || sleep 3; done >> /var/log/moura-boot.log 2>&1; sleep 5; docker compose -f /opt/moura/docker-compose.yml up -d >> /var/log/moura-boot.log 2>&1 || true'
-"@
+    $wslConf = "[boot]`ncommand = /bin/bash -c 'for i in 1 2 3 4 5; do service docker start 2>/dev/null && break; sleep 3; done'`n"
 }
 
 $wslConfFile = "$env:TEMP\wsl.conf"
@@ -342,21 +339,23 @@ Write-BashScript -Path $composeFile -Content $composeContent
 Write-Info "Arquivos copiados para /opt/moura"
 
 # Instala docker-compose-plugin + habilita servico + baixa imagens + sobe stack
-$runScript = @"
+$systemdEnableCmd = if ($systemdSupported) { "systemctl enable docker 2>/dev/null || true" } else { "" }
+
+$runScript = @'
 #!/bin/bash
 set -e
 
 # Inicia Docker com retry (necessario no primeiro boot apos wsl --shutdown)
 for i in 1 2 3 4 5; do
     service docker start 2>/dev/null && break
-    echo "Tentativa \$i falhou, aguardando..."
+    echo "Tentativa $i falhou, aguardando..."
     sleep 3
 done
 
 # Aguarda daemon ficar pronto
-for i in \$(seq 1 15); do
+for i in $(seq 1 15); do
     docker info > /dev/null 2>&1 && break
-    echo "Aguardando Docker daemon... (\$i/15)"
+    echo "Aguardando Docker daemon... ($i/15)"
     sleep 2
 done
 
@@ -370,14 +369,14 @@ if ! docker compose version > /dev/null 2>&1; then
     apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
 fi
 
-$(if ($systemdSupported) { "# systemd: habilita Docker para iniciar automaticamente no boot do WSL" + [Environment]::NewLine + "systemctl enable docker 2>/dev/null || true" })
+SYSTEMD_ENABLE_CMD
 
 echo "Baixando imagens..."
 docker compose -f /opt/moura/docker-compose.yml pull
 
 echo "Subindo stack..."
 docker compose -f /opt/moura/docker-compose.yml up -d
-"@
+'@ -replace 'SYSTEMD_ENABLE_CMD', $systemdEnableCmd
 
 $runFile = "$env:TEMP\run-moura.sh"
 Write-BashScript -Path $runFile -Content $runScript
